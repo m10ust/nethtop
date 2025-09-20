@@ -62,6 +62,7 @@ From the moment you launch, NetHtop++ sets the stage:
 You're not watching the network.  
 You're **interrogating** it.
 
+Stop duct-taping five tools together. Here’s your damn console.
 ---
 
 ## 🔧 Requirements
