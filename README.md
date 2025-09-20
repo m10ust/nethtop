@@ -83,7 +83,7 @@ You're **interrogating** it.
 ## 🚀 Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/nethtop.git
+git clone https://github.com/m10ust/nethtop.git
 cd nethtop
 pip install -r requirements.txt
 sudo python3 nethtop++.py
