@@ -93,4 +93,4 @@ pip install -r requirements.txt
 sudo python3 nethtop++.py
 ```
 
-If you’re not happy with it, open a fucking issue or make a pull request with the fix.
+If you’re not happy with it, open a fucking issue or make a pull request with the fix. You are welcome to make a Windows version fork if you want because I am not gonna do it. 
