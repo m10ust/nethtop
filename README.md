@@ -26,7 +26,7 @@
 
 NetHtop++ is a real-time **network inspection and response console** built for operators, analysts, hackers, blue teamers, red teamers, and *those who need to know what the hell is going on* — fast.
 
-Inspired by `htop`, but for sockets and flows, NetHtop++ fuses multiple tools into a single, powerful, terminal-native battlefield command interface.
+Inspired by `htop`, but for sockets and flows, NetHtop++ fuses multiple tools into a single, powerful, terminal-native battlefield command interface. Run with sudo since... Well it is interactive and can do many things that require priviledges. IE: killing sockets, adding pf rules, killswitch feature from the ghost sockets interface but be careful using the playbook in the ghost sockets overlay because it combines powerful features that could break your networking. Always backup you pf.conf before adding the whole ghost sockets list to pf. I'll add other firewalls support soon or tweak the script to include the firewall you use. 
 
 🧠 It's **htop for networks.**  
 👻 It's **a ghost hunter.**  
