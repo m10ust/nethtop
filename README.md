@@ -87,3 +87,6 @@ git clone https://github.com/YOUR_USERNAME/nethtop.git
 cd nethtop
 pip install -r requirements.txt
 sudo python3 nethtop++.py
+```
+
+If you’re not happy with it, open a fucking issue or make a pull request with the fix.
