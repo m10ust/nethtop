@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """NetHtop++: network hunt console with ghost response playbooks."""
 
-# NETWORK ARMY KNIFE
+# NETWORK ARMY KNIFE 
+# Author: Jean-Sebastien Miousse - M4Y0U - m10ust
 # The only network monitoring tool that incorporates htop like connections monitoring with kill # function, trace, ghost sockets inspector and counter-measures baked in, all interfaces easy 
 # monitoring, tcpdump to pcap file and extensive logging capabilities. Why switch between lsof
 # tcpdump, nettop, netstat, ps, nettrace, iftop etc. when you can have it all in one terminal?
