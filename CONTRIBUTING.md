@@ -40,3 +40,29 @@ git clone https://github.com/m10ust/nethtop.git
 cd nethtop
 pip install -r requirements.txt
 sudo python3 nethtop++.py
+```
+
+🚦 How to Contribute
+	1.	Fork the repo
+	2.	Create a branch:
+git checkout -b my-feature-name
+	3.	Hack. Test. Iterate.
+	4.	Open a Pull Request
+	5.	Explain what, why, and how in the PR description.
+
+⸻
+
+🚨 Pull Request Checklist
+	•	Code runs on both macOS and Linux
+	•	Doesn’t break existing flow (unless it’s an upgrade)
+	•	Feature has a toggle key if it’s interactive
+	•	You tested it live
+	•	You added yourself to the CONTRIBUTORS.md if you added >10 lines
+
+⸻
+
+🧬 Ground Truth
+
+This is not a toy. This is not a pretty dashboard.
+NetHtop++ is for people who get paged at 3am and need answers.
+Make it better for them — or leave it alone.
