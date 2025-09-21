@@ -1,7 +1,7 @@
 ![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 ![Built with Python](https://img.shields.io/badge/Made_with-Python-blue?logo=python)
 ![Terminal Only](https://img.shields.io/badge/UI-Terminal-orange)
-# 🧠 NetHtop++
+# 🧠 NetHtop++ (alpha)
 
 > **Network Hunt Console with Ghost Response Playbooks**  
 > _The NETWORK ARMY KNIFE you wish you had 10 years ago._
