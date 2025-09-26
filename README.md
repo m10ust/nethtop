@@ -60,14 +60,8 @@ Stop duct-taping five tools together. Here’s your damn console.
 ## 🔧 Requirements
 
 - Python 3.7+
-- `psutil`
-- `scapy`
-- `netifaces`
-- `colorama`
-- `curses` (Linux/macOS only)
-- `socket`
-- `subprocess`
-- `os`, `sys`, `time`, `datetime`, and many more standard modules
+psutil>=5.9
+ipwhois>=1.2
 
 > *Works best on macOS or Linux terminal with minimum 110 character width.*
 
