@@ -9,7 +9,7 @@
  <img width="1488" height="1365" alt="Screenshot 2025-09-24 at 8 13 47 PM" src="https://github.com/user-attachments/assets/a54faa25-1f53-46e1-af34-4a202d0e9b51" />
  <img width="1492" height="1366" alt="Screenshot 2025-09-24 at 8 14 40 PM" src="https://github.com/user-attachments/assets/aed5270d-1e22-45e0-8b93-7e06a583a9a9" />
                                                                                                                 
-  **Those screenshots are from an APT infected macOS system. Since it is a Mac mini there are a lot of interfaces but NetHtop++ only lists the interface running on your system. Not all possible interfaces. 60 ghost sockets is not normal macOS behaviour, nor any normal system**                                                                                                                                                                            
+  *Those screenshots are from an APT infected macOS system. Since it is a Mac mini there are a lot of interfaces but NetHtop++ only lists the interface running on your system. Not all possible interfaces. 60 ghost sockets is not normal macOS behaviour, nor any normal system*                                                                                                                                                                            
                                                                                                                                                                                                                             
  ## 🧰 What is NetHtop++?
 
