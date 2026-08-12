@@ -1,6 +1,7 @@
 ![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 ![Built with Python](https://img.shields.io/badge/Made_with-Python-blue?logo=python)
 ![Terminal Only](https://img.shields.io/badge/UI-Terminal-orange)
+![Cross-Platform](https://img.shields.io/badge/Platform-macOS_|_Linux_|_Windows-purple)
 # 🧠 NetHtop++ (alpha)
 
 > **Network Hunt Console with Ghost Response Playbooks**  
@@ -59,16 +60,25 @@ Stop duct-taping five tools together. Here’s your damn console.
 
 ## 🔧 Requirements
 
-- Python 3.7+
-psutil>=5.9
-ipwhois>=1.2
+- Python 3.8+
+- `psutil>=5.9`
+- `ipwhois>=1.2` (optional, for IP enrichment)
 
-> *Works best on macOS or Linux terminal with minimum 110 character width.*
+### Platform-specific notes
+
+| Platform | Extra dependency | Notes |
+|----------|-----------------|-------|
+| **macOS** 🍎 | None | Full features: tcpdump capture, pfctl firewall blocks, launchd scanning |
+| **Linux** 🐧 | None | Full features: tcpdump capture, /proc socket control |
+| **Windows** 🪟 | `windows-curses>=2.3` | tcpdump/pfctl/launchd gracefully disabled; use `Kill Process` for socket control |
+
+> *Same file, all platforms — `nethtop++.py` auto-detects your OS and adapts.*
 
 ---
 
 ## 🚀 Installation
 
+### macOS / Linux
 ```bash
 git clone https://github.com/m10ust/nethtop.git
 cd nethtop
@@ -76,4 +86,14 @@ pip install -r requirements.txt
 sudo python3 nethtop++.py
 ```
 
-If you’re not happy with it, open a fucking issue or make a pull request with the fix. You are welcome to make a Windows version fork if you want because I am not gonna do it. 
+### Windows
+```powershell
+git clone https://github.com/m10ust/nethtop.git
+cd nethtop
+pip install -r requirements.txt
+python nethtop++.py
+```
+
+> *Windows doesn’t need `sudo` — just run it. Packet capture (tcpdump) and firewall blocks (pfctl) show a helpful message instead of crashing.*
+
+---
