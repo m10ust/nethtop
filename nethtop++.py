@@ -29,6 +29,8 @@ from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequenc
 
 import psutil
 
+from platform_utils import IS_WINDOWS, IS_MACOS, IS_LINUX
+
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="psutil")
 
 try:  # optional enrichment helper
@@ -306,6 +308,17 @@ class PacketCaptureManager:
         if target_port:
             bpf += ["and", "port", str(target_port)]
         interface = iface or "any"
+        if IS_WINDOWS:
+            callback(
+                AlertRecord(
+                    timestamp=time.time(),
+                    category="pcap",
+                    severity="info",
+                    summary="Packet capture unavailable on Windows (tcpdump required)",
+                    details={"hint": "Install tcpdump via WSL or use pktmon"},
+                )
+            )
+            return
         cmd = [
             "tcpdump",
             "-i",
@@ -503,7 +516,7 @@ class NetTopPlusPlusApp:
         self.selected_index = 0
         self.scroll_offset = 0
         self.last_refresh = 0.0
-        self.prev_counters: Optional[Dict[str, psutil._common.snetio]] = None
+        self.prev_counters: Optional[Dict[str, Any]] = None
         self.prev_time: Optional[float] = None
         self.nic_history: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=HISTORY_LENGTH))
         self.nic_history_rx: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=HISTORY_LENGTH))
@@ -591,7 +604,7 @@ class NetTopPlusPlusApp:
                 self._record_alert(alert)
             self.ghost_last_run = now
 
-        if now - self.launchd_last_run >= LAUNCHD_SCAN_INTERVAL:
+        if not IS_WINDOWS and now - self.launchd_last_run >= LAUNCHD_SCAN_INTERVAL:
             for alert in self._scan_launchd():
                 self._record_alert(alert)
             self.launchd_last_run = now
@@ -665,7 +678,7 @@ class NetTopPlusPlusApp:
         return proc_name, cmdline
 
     @staticmethod
-    def _protocol_name(conn: psutil._common.sconn) -> str:
+    def _protocol_name(conn: Any) -> str:
         base = "?"
         if conn.type == socket.SOCK_STREAM:
             base = "TCP"
@@ -679,7 +692,7 @@ class NetTopPlusPlusApp:
         return base
 
     @staticmethod
-    def _format_addr(addr: Optional[psutil._common.addr]) -> str:
+    def _format_addr(addr: Optional[Any]) -> str:
         if not addr:
             return ""
         if isinstance(addr, tuple):
@@ -693,7 +706,7 @@ class NetTopPlusPlusApp:
         return f"{ip}:{port}"
 
     @staticmethod
-    def _extract_ip(addr: Optional[psutil._common.addr]) -> Optional[str]:
+    def _extract_ip(addr: Optional[Any]) -> Optional[str]:
         if not addr:
             return None
         if isinstance(addr, tuple):
@@ -703,7 +716,7 @@ class NetTopPlusPlusApp:
         return getattr(addr, "ip", None) or str(addr)
 
     @staticmethod
-    def _addr_tuple(addr: Optional[psutil._common.addr]) -> Optional[Tuple[str, int]]:
+    def _addr_tuple(addr: Optional[Any]) -> Optional[Tuple[str, int]]:
         if not addr:
             return None
         if isinstance(addr, tuple):
@@ -857,8 +870,11 @@ class NetTopPlusPlusApp:
             self.set_status("Socket file descriptor unavailable; cannot close")
             return
         proc_fd_path = f"/proc/{conn.pid}/fd/{fd}"
-        if not os.path.exists(proc_fd_path):
-            self.set_status("Closing sockets requires /proc access")
+        if IS_WINDOWS or not os.path.exists(proc_fd_path):
+            if IS_WINDOWS:
+                self.set_status("Closing sockets on Windows requires psutil; use 'Kill Process' instead")
+            else:
+                self.set_status("Closing sockets requires /proc access")
             return
         dup_fd: Optional[int] = None
         try:
@@ -1066,6 +1082,9 @@ class NetTopPlusPlusApp:
             self.set_status("Ghost socket has no remote peer to block")
             return
         ip, _port = remote_tuple
+        if IS_WINDOWS:
+            self.set_status(f"Firewall block unavailable on Windows (pfctl required). To block {ip}: netsh advfirewall firewall add rule ...")
+            return
         cmd = ["pfctl", "-t", PF_TABLE_NAME, "-T", "add", ip]
         output = self._run_command(cmd)
         if "does not exist" in output.lower():
@@ -1164,7 +1183,7 @@ class NetTopPlusPlusApp:
             return True
         return False
 
-    def _find_process_connection(self, row: ConnectionRow) -> Optional[psutil._common.sconn]:
+    def _find_process_connection(self, row: ConnectionRow) -> Optional[Any]:
         if row.pid is None:
             return None
         try:
@@ -1182,7 +1201,7 @@ class NetTopPlusPlusApp:
                 return candidate
         return None
 
-    def _connection_matches(self, row: ConnectionRow, conn: psutil._common.sconn) -> bool:
+    def _connection_matches(self, row: ConnectionRow, conn: Any) -> bool:
         if self._addr_tuple(conn.laddr) != row.laddr_tuple:
             return False
         if self._addr_tuple(conn.raddr) != row.raddr_tuple:
@@ -1190,7 +1209,7 @@ class NetTopPlusPlusApp:
         return self._protocol_name(conn) == row.protocol
 
     @staticmethod
-    def _process_net_connections(proc: psutil.Process) -> Optional[List[psutil._common.sconn]]:
+    def _process_net_connections(proc: psutil.Process) -> Optional[List[Any]]:
         getter = getattr(proc, "net_connections", None)
         try:
             if getter:
