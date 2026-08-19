@@ -678,7 +678,7 @@ class NetTopPlusPlusApp:
         return proc_name, cmdline
 
     @staticmethod
-    def _protocol_name(conn: Any) -> str:
+    def _protocol_name(conn) -> str:
         base = "?"
         if conn.type == socket.SOCK_STREAM:
             base = "TCP"
