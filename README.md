@@ -153,7 +153,8 @@ python3 -m unittest discover -s tests -v
 git clone https://github.com/m10ust/nethtop.git
 cd nethtop
 pip install -r requirements.txt
-sudo python3 nethtop++.py
+python3 nethtop++.py                    # read-only monitoring - no sudo needed
+sudo python3 nethtop++.py --response    # elevate only for response work
 ```
 
 ### Windows
