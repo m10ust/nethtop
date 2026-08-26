@@ -13,8 +13,10 @@ import curses
 import errno
 import json
 import os
+import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -55,6 +57,35 @@ ALERT_COOLDOWN = 30.0
 SNAPSHOT_DIR = Path.cwd() / "snapshots"
 PF_TABLE_NAME = "nethtop_ghost_block"
 CAPTURE_DURATION = 60
+# Optional external tools that unlock specific features. Missing tools degrade
+# gracefully: the feature reports "unavailable", it never fakes an answer.
+OPTIONAL_TOOLS = ("lsof", "netstat", "tcpdump", "traceroute", "tracepath")
+# Ghost-confidence scoring weights (see _ghost_confidence).
+GHOST_BASE_CONFIDENCE = 0.55
+GHOST_OWNED_PENALTY = 0.40
+GHOST_LISTEN_BONUS = 0.15
+GHOST_ESTABLISHED_BONUS = 0.05
+GHOST_PERSISTENCE_BONUS = 0.10
+GHOST_PERSISTENCE_CAP = 5
+GHOST_WARNING_THRESHOLD = 0.7
+# lsof run without privileges cannot attribute other users' sockets, so the
+# kernel/userland diff of an unprivileged scan is partly a permissions
+# artifact — deflate confidence instead of crying wolf.
+GHOST_UNPRIVILEGED_PENALTY = 0.35
+# /proc/net/tcp{,6} state codes -> names (Linux kernel socket states).
+TCP_STATE_NAMES = {
+    "01": "ESTABLISHED",
+    "02": "SYN_SENT",
+    "03": "SYN_RECV",
+    "04": "FIN_WAIT1",
+    "05": "FIN_WAIT2",
+    "06": "TIME_WAIT",
+    "07": "CLOSE",
+    "08": "CLOSE_WAIT",
+    "09": "LAST_ACK",
+    "0A": "LISTEN",
+    "0B": "CLOSING",
+}
 BANNER_LINES = [
     " /$$   /$$ /$$$$$$$$ /$$$$$$$$ /$$      /$$  /$$$$$$  /$$$$$$$  /$$   /$$        /$$$$$$  /$$$$$$$  /$$      /$$ /$$     /$$       /$$   /$$ /$$   /$$ /$$$$$$ /$$$$$$$$ /$$$$$$$$",
     "| $$$ | $$| $$_____/|__  $$__/| $$  /$ | $$ /$$__  $$| $$__  $$| $$  /$$/       /$$__  $$| $$__  $$| $$$    /$$$|  $$   /$$/      | $$  /$$/| $$$ | $$|_  $$_/| $$_____/| $$_____",
@@ -509,9 +540,13 @@ class Enricher:
 
 
 class NetTopPlusPlusApp:
-    def __init__(self, interval: float, kind: str) -> None:
+    def __init__(self, interval: float, kind: str, response: bool = False) -> None:
         self.interval = max(interval, REFRESH_MIN_INTERVAL)
         self.kind = kind
+        # Read-only is the default: destructive actions (kill, close socket,
+        # firewall, daemon restart) ask for confirmation unless --response.
+        self.response_mode = response
+        self.is_root = hasattr(os, "geteuid") and os.geteuid() == 0
         self.connections: List[ConnectionRow] = []
         self.selected_index = 0
         self.scroll_offset = 0
@@ -543,6 +578,15 @@ class NetTopPlusPlusApp:
         self.ghost_entries: List[Dict[str, Any]] = []
         self.show_ghost_overlay = False
         self.ghost_cursor = 0
+        # Ghost detection state (GPT hardening pass):
+        # - dep_availability: which optional tools are on PATH (explicit scan)
+        # - ghost_detection_unavailable: kernel/userland inventory impossible
+        # - ghost_persistence: consecutive-scan counters, feeds confidence
+        self.dep_availability: Dict[str, bool] = {
+            name: shutil.which(name) is not None for name in OPTIONAL_TOOLS
+        }
+        self.ghost_detection_unavailable = False
+        self.ghost_persistence: Dict[Tuple[str, str, str], int] = {}
         self.trace_overlay = False
         self.trace_target: Optional[str] = None
         self.trace_lines: List[str] = []
@@ -604,7 +648,9 @@ class NetTopPlusPlusApp:
                 self._record_alert(alert)
             self.ghost_last_run = now
 
-        if not IS_WINDOWS and now - self.launchd_last_run >= LAUNCHD_SCAN_INTERVAL:
+        # launchd only exists on macOS; other platforms must not fall through
+        # into a macOS-only scan (Linux has systemd, Windows has services).
+        if IS_MACOS and now - self.launchd_last_run >= LAUNCHD_SCAN_INTERVAL:
             for alert in self._scan_launchd():
                 self._record_alert(alert)
             self.launchd_last_run = now
@@ -948,6 +994,10 @@ class NetTopPlusPlusApp:
         self.packet_captures.toggle(conn, self._record_alert)
 
     def toggle_ghost_overlay(self) -> None:
+        if self.ghost_detection_unavailable:
+            self.set_status("Ghost detection unavailable - see alerts for the missing tool")
+            self.show_ghost_overlay = False
+            return
         if not self.ghost_entries:
             self.set_status("No ghost sockets detected")
             self.show_ghost_overlay = False
@@ -1085,6 +1135,14 @@ class NetTopPlusPlusApp:
         if IS_WINDOWS:
             self.set_status(f"Firewall block unavailable on Windows (pfctl required). To block {ip}: netsh advfirewall firewall add rule ...")
             return
+        if IS_LINUX:
+            # pfctl does not exist on Linux. Refuse cleanly and print the
+            # nftables equivalent for the operator instead of silently no-op'ing.
+            self.set_status(
+                f"pfctl is macOS-only. To block {ip} on Linux: "
+                f"sudo nft add element inet filter nethtop_ghost_block {{ {ip} }}"
+            )
+            return
         cmd = ["pfctl", "-t", PF_TABLE_NAME, "-T", "add", ip]
         output = self._run_command(cmd)
         if "does not exist" in output.lower():
@@ -1101,6 +1159,14 @@ class NetTopPlusPlusApp:
         self.set_status(f"pfctl response: {output.strip()[:80]}")
 
     def restart_network_daemons(self) -> None:
+        if not IS_MACOS:
+            # mDNSResponder/netbiosd/launchctl are macOS services. Do not fall
+            # through to them on other platforms; name the platform tool instead.
+            if IS_LINUX:
+                self.set_status("Restart daemons is macOS-only; on Linux use: sudo systemctl restart systemd-resolved")
+            else:
+                self.set_status("Restart daemons is macOS-only on this platform")
+            return
         uid = os.getuid()
         commands = [
             ["killall", "-HUP", "mDNSResponder"],
@@ -1271,7 +1337,9 @@ class NetTopPlusPlusApp:
                         continue
                     if remote_tuple and self._addr_tuple(conn.raddr) != remote_tuple:
                         continue
-                    if self._protocol_name(conn) != proto:
+                    # Ghost keys use the base protocol (TCP/UDP); psutil returns
+                    # TCP4/TCP6/UDP4/UDP6, so compare the base prefix.
+                    if self._protocol_name(conn)[:3].upper() != proto[:3].upper():
                         continue
                     return proc.pid
         except psutil.Error:
@@ -1279,121 +1347,359 @@ class NetTopPlusPlusApp:
         return None
 
     @staticmethod
+    def _canonical_addr(addr: str) -> str:
+        """Normalize an address string to a single `host:port` form.
+
+        Handles the three real-world formats the tool encounters:
+          - macOS netstat -anv  (dot-separated: `10.0.0.120.65360`, `fe80::1.546`)
+          - lsof -F output      (colon-separated: `10.0.0.120:49152`, `[::1]:80`)
+          - Linux netstat -an   (colon-separated: `0.0.0.0:22`)
+        Wildcards normalize too: `*.49152` -> `*:49152`, `*.*` -> `*:*`.
+        """
+        raw = addr.strip()
+        if not raw:
+            return ""
+        if raw.startswith("["):
+            # Bracketed IPv6 from lsof: [fe80::1%lo0]:546
+            if "]:" in raw:
+                host, port = raw[1:].split("]:", 1)
+                return f"{host}:{port}"
+            return raw[1:-1] if raw.endswith("]") else raw
+        if raw == "*.*":
+            return "*:*"
+        if raw.startswith("*.") and raw[2:].isdigit():
+            return f"*:{raw[2:]}"
+        if "." in raw:
+            # macOS dot form: last dot separates the port. Checked before the
+            # colon form because macOS IPv6 (`fe80::1.546`) also contains colons.
+            host, port = raw.rsplit(".", 1)
+            if port.isdigit():
+                return f"{host}:{port}"
+        if ":" in raw:
+            # Colon form (lsof, Linux netstat). IPv4 keeps its dots, IPv6 its colons.
+            host, port = raw.rsplit(":", 1)
+            if port.isdigit() or port == "*":
+                return f"{host}:{port}"
+            return raw
+        return raw
+
+    @staticmethod
     def _parse_netstat_addr(addr: str) -> Optional[Tuple[str, int]]:
         if not addr:
             return None
-        if ":" in addr:
-            # for IPv6 netstat may use '.'? but keep fallback
-            try:
-                host, port_str = addr.rsplit(":", 1)
-                return host.strip(), int(port_str)
-            except ValueError:
-                pass
-        if addr.count(".") >= 1:
-            try:
-                host, port_str = addr.rsplit(".", 1)
-                return host.strip(), int(port_str)
-            except ValueError:
-                return None
-        return None
+        canonical = NetTopPlusPlusApp._canonical_addr(addr)
+        if ":" not in canonical:
+            return None
+        host, port_str = canonical.rsplit(":", 1)
+        if not port_str.isdigit():
+            return None
+        return host, int(port_str)
 
     def _detect_ghost_sockets(self) -> List[AlertRecord]:
+        """Compare the kernel's socket inventory against lsof's userland view.
+
+        A "ghost" is a socket the kernel knows about that no userland tool can
+        attribute. This is a *confidence score*, never a binary verdict: tool
+        races, permissions, namespaces and rapidly-closing sockets all cause
+        inventory differences, so each entry carries a 0.0-1.0 confidence and
+        the reasons that produced it.
+        """
         timestamp = time.time()
-        kernel_sockets = self._parse_netstat()
-        userland_sockets = self._parse_lsof()
-        ghosts = []
-        for key, data in kernel_sockets.items():
-            if key not in userland_sockets:
-                ghosts.append((key, data))
+        lsof_available = self.dep_availability.get("lsof", False)
+        netstat_available = self.dep_availability.get("netstat", False)
+
+        kernel_sockets: Optional[Dict[Tuple[str, str, str], Dict[str, Any]]] = None
+        userland_sockets: Optional[Dict[Tuple[str, str, str], Dict[str, Any]]] = None
+
+        if IS_LINUX:
+            # Kernel truth on Linux is /proc/net/tcp{,6} + udp{,6}: fast, no
+            # external tool needed, deterministic hex format. netstat is only
+            # a fallback if /proc is unreadable.
+            tables = self._read_proc_net_tables()
+            if tables is not None:
+                kernel_sockets = self._parse_proc_net_output(tables)
+            elif netstat_available:
+                kernel_sockets = self._parse_netstat_output(self._run_command(["netstat", "-an"]))
+        else:
+            # macOS/BSD: netstat -anv is the kernel inventory (dot-separated addrs).
+            if netstat_available:
+                kernel_sockets = self._parse_netstat_output(self._run_command(["netstat", "-anv"]))
+
+        if lsof_available:
+            userland_sockets = self._parse_lsof_output(
+                self._run_command(["lsof", "-nP", "-iTCP", "-iUDP", "-FpnPTf"], timeout=10)
+            )
+
+        if kernel_sockets is None:
+            # NEVER treat an empty/missing inventory as authoritative. If we
+            # cannot read the kernel side, report unavailable — not "all ghosts".
+            self._ghost_unavailable(timestamp, "netstat", "netstat is not installed")
+            return []
+        if userland_sockets is None:
+            # An empty lsof result must not be read as "lsof sees nothing" —
+            # with lsof missing, every socket would be mislabeled a ghost.
+            self._ghost_unavailable(timestamp, "lsof", "lsof is not installed")
+            return []
+        if not userland_sockets:
+            # lsof ran but produced nothing (permissions/namespace): without a
+            # userland inventory the comparison is meaningless, not "all ghost".
+            self._ghost_unavailable(timestamp, "lsof", "lsof returned no data")
+            return []
+
+        self.ghost_detection_unavailable = False
+        ghosts = [(key, data) for key, data in kernel_sockets.items() if key not in userland_sockets]
+        unprivileged = not self.is_root
+
         entries: List[Dict[str, Any]] = []
+        seen_keys: set = set()
         for key, data in ghosts:
             proto, local, remote = key
+            seen_keys.add(key)
             candidate_pid = self._identify_process_for_socket(proto, local, remote)
+            persistence = self.ghost_persistence.get(key, 0)
+            confidence, reasons = self._ghost_confidence(data, candidate_pid, persistence, unprivileged=unprivileged)
             entries.append(
                 {
-                    "protocol": proto,
+                    "protocol": data.get("proto", proto),
                     "local": local,
                     "remote": remote,
                     "state": data.get("state"),
                     "detected_at": timestamp,
                     "candidate_pid": candidate_pid,
+                    "confidence": confidence,
+                    "reasons": reasons,
                 }
             )
+        # Persistence bookkeeping: entries seen this scan age in, unseen decay out.
+        self.ghost_persistence = {
+            key: min(self.ghost_persistence.get(key, 0) + 1, GHOST_PERSISTENCE_CAP)
+            for key in seen_keys
+        }
+        entries.sort(key=lambda entry: entry["confidence"], reverse=True)
         self.ghost_entries = entries
         if self.ghost_cursor >= len(self.ghost_entries):
             self.ghost_cursor = max(0, len(self.ghost_entries) - 1)
         if not ghosts:
             self.show_ghost_overlay = False
+
         alerts: List[AlertRecord] = []
         if ghosts:
-            top = ghosts[:10]
+            high_confidence = [e for e in entries if e["confidence"] >= GHOST_WARNING_THRESHOLD]
+            severity = "warning" if high_confidence else "info"
+            top = entries[:10]
+            details: Dict[str, Any] = {
+                "samples": [
+                    {
+                        "protocol": item["protocol"],
+                        "local": item["local"],
+                        "remote": item["remote"],
+                        "state": item["state"],
+                        "confidence": item["confidence"],
+                        "reasons": item["reasons"],
+                    }
+                    for item in top
+                ]
+            }
+            if unprivileged:
+                details["hint"] = "Run nethtop++ elevated (sudo) for full-strength ghost attribution"
             alerts.append(
                 AlertRecord(
                     timestamp=timestamp,
                     category="ghost",
-                    severity="warning",
-                    summary=f"{len(ghosts)} ghost sockets detected",
-                    details={
-                        "samples": [
-                            {
-                                "protocol": item[0][0],
-                                "local": item[0][1],
-                                "remote": item[0][2],
-                                "state": item[1].get("state"),
-                            }
-                            for item in top
-                        ]
-                    },
+                    severity=severity,
+                    summary=f"{len(ghosts)} ghost sockets detected ({len(high_confidence)} high-confidence)",
+                    details=details,
                 )
             )
         return alerts
 
-    def _parse_netstat(self) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    def _ghost_unavailable(self, timestamp: float, tool: str, reason: str) -> None:
+        """Record the unavailable state without ever emitting ghost verdicts."""
+        self.ghost_detection_unavailable = True
+        self.ghost_entries = []
+        self.show_ghost_overlay = False
+        if self.ghost_cursor >= len(self.ghost_entries):
+            self.ghost_cursor = max(0, len(self.ghost_entries) - 1)
+        self._record_alert(
+            AlertRecord(
+                timestamp=timestamp,
+                category="ghost",
+                severity="info",
+                summary=f"Ghost detection unavailable: {reason}",
+                details={"tool": tool},
+            )
+        )
+
+    @staticmethod
+    def _ghost_confidence(
+        data: Dict[str, Any],
+        candidate_pid: Optional[int],
+        persistence: int,
+        unprivileged: bool = False,
+    ) -> Tuple[float, List[str]]:
+        """Score a kernel/userland mismatch 0.0-1.0 with human-readable reasons."""
+        confidence = GHOST_BASE_CONFIDENCE
+        reasons: List[str] = ["kernel/userland inventory mismatch"]
+        if unprivileged:
+            confidence -= GHOST_UNPRIVILEGED_PENALTY
+            reasons.append("unprivileged scan - may be another user's socket")
+        if candidate_pid is not None:
+            confidence -= GHOST_OWNED_PENALTY
+            reasons.append("owned by a live process (likely tool race)")
+        state = (data.get("state") or "").upper()
+        if state == "LISTEN":
+            confidence += GHOST_LISTEN_BONUS
+            reasons.append("unowned listener")
+        elif state == "ESTABLISHED":
+            confidence += GHOST_ESTABLISHED_BONUS
+            reasons.append("active established session")
+        if persistence > 0:
+            bonus = min(GHOST_PERSISTENCE_BONUS * persistence, 0.30)
+            confidence += bonus
+            reasons.append(f"persistent across {persistence} previous scan(s)")
+        return round(max(0.0, min(confidence, 1.0)), 2), reasons
+
+    @staticmethod
+    def _parse_netstat_output(output: str) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+        """Parse netstat output into canonical `host:port` keys.
+
+        Handles macOS `netstat -anv` (dot-separated addresses, extra columns)
+        and Linux `netstat -an` (colon-separated). Local=col 4, remote=col 5,
+        state=col 6 in both formats. Keys use the base protocol (TCP/UDP) so
+        v4/v6 variants compare against lsof, which does not distinguish them.
+        """
         result: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-        output = self._run_command(["netstat", "-anv"])
         if not output:
             return result
         for line in output.splitlines():
             parts = line.split()
-            if len(parts) < 5:
+            if len(parts) < 6:
                 continue
             proto = parts[0].lower()
             if not (proto.startswith("tcp") or proto.startswith("udp")):
                 continue
-            local = parts[3]
-            remote = parts[4] if len(parts) > 4 else ""
-            state = parts[5] if len(parts) > 5 else ""
-            key = (proto.upper(), local, remote)
-            result[key] = {"state": state}
+            local = NetTopPlusPlusApp._canonical_addr(parts[3])
+            remote = NetTopPlusPlusApp._canonical_addr(parts[4])
+            state = parts[5]
+            if not local:
+                continue
+            base = "TCP" if proto.startswith("tcp") else "UDP"
+            key = (base, local, remote)
+            result[key] = {"state": state, "proto": proto.upper()}
         return result
 
-    def _parse_lsof(self) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    def _read_proc_net_tables(self) -> Optional[List[Tuple[str, str]]]:
+        """Read /proc/net socket tables (Linux kernel ground truth).
+
+        Returns a list of (proto, text) for every table that could be read, or
+        None when none were readable.
+        """
+        tables: List[Tuple[str, str]] = []
+        for path, proto in (
+            ("/proc/net/tcp", "TCP"),
+            ("/proc/net/tcp6", "TCP6"),
+            ("/proc/net/udp", "UDP"),
+            ("/proc/net/udp6", "UDP6"),
+        ):
+            try:
+                text = Path(path).read_text(encoding="ascii", errors="replace")
+            except OSError:
+                continue
+            tables.append((proto, text))
+        return tables if tables else None
+
+    @staticmethod
+    def _parse_proc_net_output(tables: List[Tuple[str, str]]) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+        """Parse /proc/net/{tcp,tcp6,udp,udp6} tables into canonical keys.
+
+        Row format: `sl local_address rem_address st ...` with little-endian
+        hex addresses (`0100007F:1F90` = 127.0.0.1:8080).
+        """
         result: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for proto, text in tables:
+            for line in text.splitlines()[1:]:  # skip the header row
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                local_hex, local_port = parts[1].split(":", 1)
+                remote_hex, remote_port = parts[2].split(":", 1)
+                state_code = parts[3].upper()
+                # IPv6 addresses are 32 hex chars, IPv4 are 8 (the ':' here is
+                # the addr/port separator, so length — not ':' — picks v4 vs v6).
+                if len(local_hex) > 8:
+                    local_host = NetTopPlusPlusApp._ipv6_from_hex(local_hex)
+                else:
+                    local_host = NetTopPlusPlusApp._ipv4_from_hex(local_hex)
+                if len(remote_hex) > 8:
+                    remote_host = NetTopPlusPlusApp._ipv6_from_hex(remote_hex)
+                else:
+                    remote_host = NetTopPlusPlusApp._ipv4_from_hex(remote_hex)
+                local = f"{local_host}:{int(local_port, 16)}"
+                remote = f"{remote_host}:{int(remote_port, 16)}"
+                if proto.startswith("UDP"):
+                    state = "UNCONN" if state_code == "07" else TCP_STATE_NAMES.get(state_code, state_code)
+                else:
+                    state = TCP_STATE_NAMES.get(state_code, state_code)
+                base = "TCP" if proto.startswith("TCP") else "UDP"
+                key = (base, local, remote)
+                result[key] = {"state": state, "proto": proto}
+        return result
+
+    @staticmethod
+    def _ipv4_from_hex(hex_addr: str) -> str:
+        raw = bytes.fromhex(hex_addr.zfill(8))
+        return ".".join(str(byte) for byte in reversed(raw))
+
+    @staticmethod
+    def _ipv6_from_hex(hex_addr: str) -> str:
+        """Decode a /proc/net IPv6 address (4 little-endian 32-bit words).
+
+        Compression matters: lsof prints IPv6 compressed (`::`, `::1`), so the
+        kernel-side decoder must too, or keys never match on the Linux path.
+        """
+        raw = bytes.fromhex(hex_addr.zfill(32))
+        words = struct.unpack("<4I", raw)
+        # /proc/net lists the least-significant 32-bit word first, so reverse
+        # before packing to network order.
+        packed = struct.pack(">4I", *reversed(words))
         try:
-            output = self._run_command(["lsof", "-nP", "-iTCP", "-iUDP", "-FpnPTf"], timeout=10)
-        except FileNotFoundError:
-            return result
-        line_pid = None
-        proto = None
-        local = ""
-        remote = ""
-        for line in output.splitlines():
+            return socket.inet_ntop(socket.AF_INET6, packed)
+        except (OSError, ValueError):
+            return ":".join(f"{word:x}" for word in words)
+
+    @staticmethod
+    def _parse_lsof_output(output: str) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+        """Parse `lsof -nP -iTCP -iUDP -FpnPTf` field output into canonical keys.
+
+        Field format: `p<pid>` opens a process block; within it `P<proto>` sets
+        the protocol and each `n<addr>` line yields one socket (with `->` when
+        there is a remote peer). Remote-less lines (listeners) normalize to
+        `*:*` so they compare against netstat's `*.*`.
+        """
+        result: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        line_pid: Optional[str] = None
+        proto: Optional[str] = None
+        for line in (output or "").splitlines():
             if not line:
                 continue
-            prefix = line[0]
-            value = line[1:]
+            prefix, value = line[0], line[1:]
             if prefix == "p":
                 line_pid = value
             elif prefix == "P":
                 proto = value.upper()
             elif prefix == "n":
                 if "->" in value:
-                    local, remote = value.split("->", 1)
+                    local_raw, remote_raw = value.split("->", 1)
+                    local = NetTopPlusPlusApp._canonical_addr(local_raw)
+                    remote = NetTopPlusPlusApp._canonical_addr(remote_raw)
                 else:
-                    local = value
-                    remote = ""
-                key = (proto or "?", local, remote)
-                result[key] = {"pid": line_pid}
+                    local = NetTopPlusPlusApp._canonical_addr(value)
+                    remote = "*:*"
+                if not local:
+                    continue
+                base = "TCP" if (proto or "").startswith("TCP") else "UDP"
+                key = (base, local, remote)
+                result[key] = {"pid": line_pid, "proto": proto or "?"}
         return result
 
     def _scan_launchd(self) -> List[AlertRecord]:
@@ -1534,6 +1840,46 @@ class NetTopPlusPlusApp:
                 return error.splitlines()
         return ["Traceroute command not available on this system"]
 
+    def _confirm_and_run(self, stdscr: "curses._CursesWindow", prompt: str, action: Callable[[], None]) -> None:
+        """Run `action` immediately in --response mode, else ask y/N first.
+
+        Read-only is the default: killing processes, closing sockets and
+        modifying firewall state are irreversible on a live box, so the modal
+        blocks until the operator answers (y/n/esc). The main loop is
+        intentionally paused while the question is open.
+        """
+        if self.response_mode:
+            action()
+            return
+        height, width = stdscr.getmaxyx()
+        box_w = min(76, max(40, width - 4))
+        text = self._truncate(prompt, box_w - 4)
+        lines = 4
+        start_y = max(0, (height - lines) // 2)
+        start_x = max(0, (width - box_w) // 2)
+        while True:
+            win = curses.newwin(lines, box_w, start_y, start_x)
+            if curses.has_colors():
+                win.bkgd(" ", curses.color_pair(3))
+            try:
+                win.box()
+                win.addstr(1, 2, text)
+                win.addstr(2, 2, "Confirm? [y/N]  (esc/q cancels)", curses.A_BOLD)
+            except curses.error:
+                pass
+            win.refresh()
+            key = stdscr.getch()
+            if key in (ord("y"), ord("Y")):
+                action()
+                self.last_refresh = 0.0
+                return
+            if key in (ord("n"), ord("N"), 27, ord("q"), ord("Q")):
+                self.set_status("Cancelled")
+                self.last_refresh = 0.0
+                return
+            if key == -1:
+                continue
+
     def _main(self, stdscr: "curses._CursesWindow") -> None:
         curses.curs_set(0)
         stdscr.nodelay(True)
@@ -1546,6 +1892,11 @@ class NetTopPlusPlusApp:
             curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN)
             curses.init_pair(4, curses.COLOR_GREEN, -1)
             curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+        missing = [name for name, available in self.dep_availability.items() if not available]
+        if missing:
+            self.set_status(f"Optional tools missing: {', '.join(missing)} - related features disabled")
+        if self.is_root and not self.response_mode:
+            self.set_status("Running as root - read-only mode recommended for monitoring")
         while True:
             now = time.time()
             if now - self.last_refresh >= self.interval:
@@ -1561,7 +1912,7 @@ class NetTopPlusPlusApp:
                 continue
             if self.trace_overlay and self._handle_trace_overlay_key(key):
                 continue
-            if self.show_ghost_overlay and self._handle_ghost_overlay_key(key):
+            if self.show_ghost_overlay and self._handle_ghost_overlay_key(key, stdscr):
                 continue
             if key in (ord("q"), ord("Q")):
                 break
@@ -1582,9 +1933,25 @@ class NetTopPlusPlusApp:
             elif key == ord(" "):
                 self.last_refresh = 0.0
             elif key in (ord("x"), ord("X")):
-                self.close_selected_connection()
+                conn = self._current_selection()
+                if conn:
+                    self._confirm_and_run(
+                        stdscr,
+                        f"Close socket {conn.laddr} -> {conn.raddr or '[none]'}?",
+                        self.close_selected_connection,
+                    )
+                else:
+                    self.close_selected_connection()
             elif key in (ord("p"), ord("P")):
-                self.terminate_selected_process()
+                conn = self._current_selection()
+                if conn and conn.pid:
+                    self._confirm_and_run(
+                        stdscr,
+                        f"Kill process PID {conn.pid} ({conn.proc_name})?",
+                        self.terminate_selected_process,
+                    )
+                else:
+                    self.terminate_selected_process()
             elif key in (ord("t"), ord("T")):
                 self.toggle_packet_capture()
             elif key in (ord("o"), ord("O")):
@@ -1610,7 +1977,8 @@ class NetTopPlusPlusApp:
         for idx, line in enumerate(BANNER_LINES):
             centered = line.center(width)
             self._safe_addstr(stdscr, idx, 0, centered[:width], header_color)
-        header_text = f" NetHtop++ - {len(self.connections)} connections - {time.strftime('%H:%M:%S')} "
+        mode_tag = " [RESPONSE]" if self.response_mode else " [READ-ONLY]"
+        header_text = f" NetHtop++ - {len(self.connections)} connections - {time.strftime('%H:%M:%S')}{mode_tag} "
         focus_width = 0
         focus_start = width
         if width >= 60 and height >= 5:
@@ -1620,7 +1988,7 @@ class NetTopPlusPlusApp:
         left_width = focus_start if focus_width else width
         header_y = banner_height
         self._safe_addstr(stdscr, header_y, 0, header_text[:left_width].ljust(left_width), header_color)
-        instruction = " arrows move  PgUp/PgDn jump  r resolve  x close  p kill  t capture  c iface-cap  z trace  o ghosts(S/K/F/R/H)  d dump  e export  q quit "
+        instruction = " arrows move  PgUp/PgDn jump  r resolve  x close*  p kill*  t capture  c iface-cap  z trace  o ghosts(S/K*/F*/R*/H*)  d dump  e export  q quit " + (" (*confirmed)" if not self.response_mode else "")
         instr_color = curses.color_pair(2) if curses.has_colors() else curses.A_BOLD
         instruction_y = header_y + 1
         self._safe_addstr(stdscr, instruction_y, 0, instruction[:left_width].ljust(left_width), instr_color)
@@ -1823,25 +2191,32 @@ class NetTopPlusPlusApp:
         except curses.error:
             pass
         info_line_start = 2
-        if not self.ghost_entries:
+        if self.ghost_detection_unavailable:
+            try:
+                win.addstr(info_line_start, 2, "Ghost detection unavailable (missing tool - see alerts)", curses.A_DIM)
+            except curses.error:
+                pass
+        elif not self.ghost_entries:
             try:
                 win.addstr(info_line_start, 2, "No ghost sockets detected", curses.A_DIM)
             except curses.error:
                 pass
         else:
-            header = "Sel Proto   Local Address                 Remote Address                State"
+            header = "Sel Proto   Local Address        Remote Address       State       Conf"
             try:
                 win.addstr(1, 2, header[: overlay_w - 4], curses.A_UNDERLINE)
             except curses.error:
                 pass
-            max_rows = max(0, overlay_h - 7)
+            max_rows = max(0, overlay_h - 8)
             for idx, entry in enumerate(self.ghost_entries[: max_rows]):
                 pointer = ">" if idx == self.ghost_cursor else " "
+                confidence = entry.get("confidence", 0.0)
                 line = (
-                    f"{pointer} {entry.get('protocol',''):<6} "
-                    f"{self._truncate(entry.get('local',''), 24):<24}  "
-                    f"{self._truncate(entry.get('remote',''), 24):<24}  "
-                    f"{self._truncate(entry.get('state',''), 10):<10}"
+                    f"{pointer} {self._truncate(entry.get('protocol',''), 5):<5} "
+                    f"{self._truncate(entry.get('local',''), 21):<21} "
+                    f"{self._truncate(entry.get('remote',''), 21):<21} "
+                    f"{self._truncate(entry.get('state',''), 10):<10} "
+                    f"{confidence:4.2f}"
                 )
                 try:
                     win.addstr(info_line_start + idx, 2, line[: overlay_w - 4])
@@ -1849,12 +2224,13 @@ class NetTopPlusPlusApp:
                     break
             detail_line = info_line_start + max_rows + 1
             entry = self._current_ghost_entry()
-            if entry and detail_line < overlay_h - 3:
+            if entry and detail_line < overlay_h - 4:
                 detected_at = entry.get("detected_at")
                 detected_text = datetime.fromtimestamp(detected_at, timezone.utc).isoformat().replace("+00:00", "Z") if detected_at else "n/a"
+                reasons = "; ".join(entry.get("reasons", [])) or "kernel/userland inventory mismatch"
                 detail_lines = [
-                    f"Detected: {detected_text}",
-                    f"Owner PID: {entry.get('candidate_pid') or 'n/a'}",
+                    f"Confidence: {entry.get('confidence', 0.0):.2f} - {reasons}",
+                    f"Detected: {detected_text}  Owner PID: {entry.get('candidate_pid') or 'n/a'}",
                     f"Plan: S snapshot | K grace kill | F pf drop | R restart svc | H hard kill",
                 ]
                 for offset, text in enumerate(detail_lines):
@@ -1907,7 +2283,7 @@ class NetTopPlusPlusApp:
             pass
         win.refresh()
 
-    def _handle_ghost_overlay_key(self, key: int) -> bool:
+    def _handle_ghost_overlay_key(self, key: int, stdscr: "curses._CursesWindow") -> bool:
         if not self.show_ghost_overlay:
             return False
         if key in (curses.KEY_UP, ord("k")):
@@ -1920,16 +2296,32 @@ class NetTopPlusPlusApp:
             self.snapshot_current_ghost()
             return True
         if key == ord("K"):
-            self.graceful_shutdown_ghost()
+            self._confirm_and_run(
+                stdscr,
+                "Gracefully terminate the ghost socket's owning process?",
+                self.graceful_shutdown_ghost,
+            )
             return True
         if key == ord("F"):
-            self.firewall_block_ghost()
+            self._confirm_and_run(
+                stdscr,
+                "Add the ghost's remote peer to the pf firewall block table?",
+                self.firewall_block_ghost,
+            )
             return True
         if key == ord("R"):
-            self.restart_network_daemons()
+            self._confirm_and_run(
+                stdscr,
+                "Restart network daemons (mDNSResponder/netbiosd/docker backend)?",
+                self.restart_network_daemons,
+            )
             return True
         if key == ord("H"):
-            self.hard_kill_ghost()
+            self._confirm_and_run(
+                stdscr,
+                "Hard-close the ghost socket (SIGKILL-class, last resort)?",
+                self.hard_kill_ghost,
+            )
             return True
         if key in (ord("o"), ord("O")):
             self.toggle_ghost_overlay()
@@ -2021,12 +2413,18 @@ def parse_args() -> argparse.Namespace:
         choices=["inet", "inet4", "inet6", "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6"],
         help="Connection kind (psutil net_connections kind)",
     )
+    parser.add_argument(
+        "--response",
+        action="store_true",
+        help="Response mode: destructive actions (kill, close socket, firewall, "
+        "daemon restart) run without confirmation prompts. Default is read-only.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    app = NetTopPlusPlusApp(interval=args.interval, kind=args.kind)
+    app = NetTopPlusPlusApp(interval=args.interval, kind=args.kind, response=args.response)
     app.run()
 
 
