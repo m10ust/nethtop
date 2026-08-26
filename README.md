@@ -30,12 +30,12 @@ Inspired by `htop`, but for sockets and flows, NetHtop++ fuses multiple tools in
 | Feature | Description |
 |--------|-------------|
 | 🔍 **Live Socket Inspector** | Real-time view of all TCP/UDP connections, resolved hostnames, states, PIDs, and more. |
-| 💀 **Ghost Socket Detection** | Reveal and count stealthy sockets not exposed via typical tools. |
-| 🎯 **One-Key Tracing** | Press `t` to trace route of selected connection. |
-| 📡 **Targeted Tcpdump** | Press `c` to launch a targeted `tcpdump` on the selected connection's interface. |
+| 💀 **Ghost Socket Detection** | Reveal and count stealthy sockets not exposed via typical tools, scored by confidence. |
+| 🎯 **One-Key Tracing** | Press `z` to trace route of selected connection. |
+| 📡 **Targeted Tcpdump** | Press `t` to launch a targeted `tcpdump` on the selected connection's interface. |
 | 🧾 **PCAP Logging** | Captures are auto-saved in `nethtop` directory. |
 | 📈 **Interface Throughput Graphs** | TX/RX bars per interface. Always visible. Real-time updates. |
-| 🔪 **Process Killing** | Kill offending connections instantly with `k`. |
+| 🔪 **Process Killing** | Kill offending connections instantly with `p`. |
 | 🧠 **Playbooks + Countermeasures** | Ghost socket recon tools and embedded response flow. |
 | 🌐 **Resolve Mode** | Instantly resolve IPs to hostnames (`r`). |
 | 💾 **Export to Log** | Full session dump to log file. |
@@ -73,6 +73,76 @@ Stop duct-taping five tools together. Here’s your damn console.
 | **Windows** 🪟 | `windows-curses>=2.3` | tcpdump/pfctl/launchd gracefully disabled; use `Kill Process` for socket control |
 
 > *Same file, all platforms — `nethtop++.py` auto-detects your OS and adapts.*
+
+---
+
+## 🛡️ Read-only by default
+
+NetHtop++ opens in **read-only mode**: `p` (kill), `x` (close socket), and the
+ghost playbook (`K` graceful kill, `F` firewall block, `R` restart daemons,
+`H` hard kill) all require a **y/N confirmation** before acting. The header
+shows `[READ-ONLY]` while this is active.
+
+```bash
+sudo python3 nethtop++.py --response   # response mode: destructive keys act immediately
+```
+
+Response mode displays `[RESPONSE]` in the header. Use it deliberately — it
+skips every confirmation.
+
+### Privilege separation
+
+- Run the console **unprivileged** for monitoring. It works fine without root.
+- Privileged operations (`pfctl` blocks, killing other users' processes,
+  `/proc` socket access) only succeed when you run elevated — use
+  `sudo python3 nethtop++.py` (optionally with `--response`) only for actual
+  response work.
+- Ghost detection accounts for the privilege gap: an unprivileged `lsof`
+  cannot attribute other users' sockets, so those inventory differences are
+  reported at **lower confidence** with a note, and the alert carries a hint
+  to re-scan elevated for full-strength attribution.
+
+### Ghost sockets are a confidence score, not a binary verdict
+
+Kernel (`netstat -anv` on macOS, `/proc/net/{tcp,tcp6,udp,udp6}` on Linux)
+and userland (`lsof`) inventories are compared on canonical `host:port` keys.
+Each mismatch is scored **0.0–1.0** with its reasons:
+
+| Signal | Effect |
+|--------|--------|
+| Owned by a live process (psutil) | −0.40 — likely a tool race |
+| Unprivileged scan | −0.35 — may be another user's socket |
+| Unowned `LISTEN` socket | +0.15 |
+| Active `ESTABLISHED` session | +0.05 |
+| Persistent across scans | +0.10 per scan (max +0.30) |
+
+Entries at/above **0.70** raise a warning; the overlay sorts by confidence.
+When `lsof` or `netstat` is missing (or `lsof` returns nothing), detection
+reports **"ghost detection unavailable"** — it never treats an empty
+inventory as "no ghosts".
+
+### Optional tools
+
+Detected at startup and reported in the status line:
+
+| Tool | Feature |
+|------|---------|
+| `lsof` | Ghost detection (userland inventory) |
+| `netstat` | Ghost detection (kernel inventory, macOS/BSD) |
+| `tcpdump` | Packet capture |
+| `traceroute` / `tracepath` | Route tracing |
+
+Missing tools disable their feature gracefully — no crashes, no fake data.
+
+### Tests
+
+Parser fixtures + unit tests live in `tests/` (stdlib `unittest`, zero extra
+dependencies) and cover macOS `netstat -anv`, Linux `/proc/net`, and `lsof -F`
+output:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ---
 
