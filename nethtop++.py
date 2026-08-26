@@ -9,7 +9,21 @@
 
 import argparse
 import contextlib
-import curses
+try:  # curses ships with CPython on macOS/Linux, but needs windows-curses on Windows
+    import curses
+except ImportError as exc:  # pragma: no cover - platform-dependent
+    print(
+        "NetHtop++ needs the curses module, which is not installed on this system.\n"
+        "\n"
+        "On Windows, install the backport:\n"
+        "  pip install -r requirements.txt\n"
+        "\n"
+        "On Linux, install your distro's package, e.g.:\n"
+        "  sudo apt install python3-curses     # Debian/Ubuntu/Kali\n"
+        "  sudo pacman -S python               # Arch (bundled, usually present)",
+        file=sys.stderr,
+    )
+    raise SystemExit(1) from exc
 import errno
 import json
 import os
@@ -29,7 +43,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import psutil
+try:  # hard dependency: every inventory path needs psutil
+    import psutil
+except ImportError as exc:  # pragma: no cover - environment-dependent
+    print(
+        "NetHtop++ needs psutil, which is not installed on this system.\n"
+        "\n"
+        "Install it with one of:\n"
+        "  pip install -r requirements.txt     # any platform\n"
+        "  sudo pacman -S python-psutil        # Arch/Omarchy (system package)\n"
+        "  sudo apt install python3-psutil     # Debian/Ubuntu/Kali",
+        file=sys.stderr,
+    )
+    raise SystemExit(1) from exc
 
 from platform_utils import IS_WINDOWS, IS_MACOS, IS_LINUX
 
