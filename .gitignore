@@ -1,0 +1,11 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Runtime output nethtop can create next to the source
+snapshots/
+hunters/
+
+# Editors / OS
+.DS_Store
+*.swp
