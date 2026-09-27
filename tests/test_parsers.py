@@ -108,8 +108,8 @@ class LinuxProcNetParseTests(unittest.TestCase):
     def test_tcp_table(self):
         tables = [("TCP", _fixture("linux_proc_net_tcp.txt"))]
         parsed = App._parse_proc_net_output(tables)
-        self.assertIn(("TCP", "127.0.0.1:8080", "0.0.0.0:0"), parsed)
-        self.assertEqual(parsed[("TCP", "127.0.0.1:8080", "0.0.0.0:0")]["state"], "LISTEN")
+        self.assertIn(("TCP", "127.0.0.1:8080", "*:*"), parsed)
+        self.assertEqual(parsed[("TCP", "127.0.0.1:8080", "*:*")]["state"], "LISTEN")
         # 640AA8C0 little-endian = 192.168.10.100, 08080808 = 8.8.8.8, 01BB = 443
         self.assertIn(("TCP", "192.168.10.100:51966", "8.8.8.8:443"), parsed)
         self.assertEqual(parsed[("TCP", "192.168.10.100:51966", "8.8.8.8:443")]["state"], "ESTABLISHED")
@@ -117,15 +117,15 @@ class LinuxProcNetParseTests(unittest.TestCase):
     def test_ipv6_rows(self):
         tables = [("TCP6", _fixture("linux_proc_net_tcp.txt"))]
         parsed = App._parse_proc_net_output(tables)
-        # all-zero IPv6 -> "::" host
-        self.assertIn(("TCP", ":::5796", ":::0"), parsed)
+        # all-zero IPv6 is a wildcard bind -> "*", matching what lsof prints
+        self.assertIn(("TCP", "*:5796", "*:*"), parsed)
         # ::1:80 — compressed, matching lsof's canonical "[::1]:80" -> "::1:80"
-        self.assertIn(("TCP", "::1:80", ":::0"), parsed)
+        self.assertIn(("TCP", "::1:80", "*:*"), parsed)
 
     def test_udp_state_unconn(self):
         tables = [("UDP", _fixture("linux_proc_net_udp.txt"))]
         parsed = App._parse_proc_net_output(tables)
-        self.assertEqual(parsed[("UDP", "127.0.0.1:53", "0.0.0.0:0")]["state"], "UNCONN")
+        self.assertEqual(parsed[("UDP", "127.0.0.1:53", "*:*")]["state"], "UNCONN")
 
 
 class LsofParseTests(unittest.TestCase):
@@ -162,6 +162,57 @@ class KernelUserlandMatchTests(unittest.TestCase):
         self.assertIn(("TCP", "*:49152", "*:*"), kernel)
         self.assertIn(("TCP", "*:49152", "*:*"), userland)
         self.assertNotIn(("TCP", "*:49152", "*:*"), {k for k in kernel if k not in userland})
+
+
+class LinuxKernelUserlandMatchTests(unittest.TestCase):
+    """The Linux sibling of the macOS canonical-key test.
+
+    The hardening pass canonicalized key spelling for macOS, where netstat uses
+    the dot form and lsof the colon form. The Linux /proc parser was left
+    emitting 0.0.0.0:0 for an absent peer and 0.0.0.0 for a wildcard bind, while
+    lsof emits *:* and *, so on Linux every listener that both tools could
+    plainly see was scored as a ghost.
+    """
+
+    WILDCARD_ROW = (
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
+        "   uid  timeout inode\n"
+        "   0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000"
+        "     0        0 90001 1 0000000000000000 100 0 0 10 0\n"
+    )
+
+    def test_shared_socket_is_not_a_ghost(self):
+        kernel = App._parse_proc_net_output([("TCP", _fixture("linux_proc_net_tcp.txt"))])
+        userland = App._parse_lsof_output(_fixture("lsof_linux.txt"))
+        self.assertIn(("TCP", "192.168.10.100:51966", "8.8.8.8:443"), kernel)
+        self.assertIn(("TCP", "192.168.10.100:51966", "8.8.8.8:443"), userland)
+        self.assertNotIn(("TCP", "192.168.10.100:51966", "8.8.8.8:443"),
+                         {k for k in kernel if k not in userland})
+
+    def test_wildcard_bind_matches_across_parsers(self):
+        """A wildcard listener is 0.0.0.0 in /proc and * in lsof."""
+        kernel = App._parse_proc_net_output([("TCP", self.WILDCARD_ROW)])
+        userland = App._parse_lsof_output(_fixture("lsof_linux.txt"))
+        self.assertIn(("TCP", "*:8080", "*:*"), kernel)
+        self.assertIn(("TCP", "*:8080", "*:*"), userland)
+        self.assertEqual([k for k in kernel if k not in userland], [])
+
+    def test_no_parser_leaks_a_raw_null_endpoint(self):
+        kernel = App._parse_proc_net_output([
+            ("TCP", _fixture("linux_proc_net_tcp.txt")),
+            ("UDP", _fixture("linux_proc_net_udp.txt")),
+        ])
+        userland = App._parse_lsof_output(_fixture("lsof_linux.txt"))
+        for key in kernel:
+            self.assertNotIn(key[2], ("0.0.0.0:0", ":::0", "::0"),
+                             "a raw null remote leaked into a kernel key")
+        for key in userland:
+            # A real peer keeps its address; only a null peer collapses.
+            self.assertNotEqual(key[2], "", "lsof peer must never be empty")
+            self.assertNotIn(key[2], ("0.0.0.0:0", ":::0", "*.*"),
+                             "a raw null peer leaked into an lsof key")
+        # the listener really is canonicalized, and keeps its pid
+        self.assertEqual(userland[("TCP", "*:8080", "*:*")]["pid"], "1122")
 
 
 class GhostConfidenceTests(unittest.TestCase):

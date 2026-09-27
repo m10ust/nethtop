@@ -1405,6 +1405,40 @@ class NetTopPlusPlusApp:
             return None
         return None
 
+    # Endpoints that mean "no peer" or "every interface". Linux /proc/net calls a
+    # wildcard bind 0.0.0.0 (:: for IPv6) and an absent peer 0.0.0.0:0; lsof
+    # prints * and *:*; macOS netstat prints *.* for both. Same socket, three
+    # spellings, so every side has to collapse to one or the kernel/userland diff
+    # reports sockets that both tools can plainly see.
+    NULL_ENDPOINTS = ("*:*", "*.*", "0.0.0.0:0", ":::0", "::0", "0.0.0.0:*", "*:0", ":::")
+
+    @staticmethod
+    def _canonical_endpoint(addr: str) -> str:
+        """Collapse wildcard and absent-peer spellings so keys compare equal.
+
+        The hardening pass canonicalized this for macOS (netstat dot form vs lsof
+        colon form) but the Linux /proc parser kept emitting 0.0.0.0:0, so on
+        Linux a listener both tools could see was still scored as a ghost.
+        """
+        raw = (addr or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith("["):
+            # bracketed IPv6 from lsof: [fe80::1%lo0]:546
+            if "]:" in raw:
+                host, port = raw[1:].split("]:", 1)
+                raw = f"{host}:{port}"
+            else:
+                return raw[1:-1] if raw.endswith("]") else raw
+        if raw in NetTopPlusPlusApp.NULL_ENDPOINTS:
+            return "*:*"
+        if ":" not in raw:
+            return raw
+        host, port = raw.rsplit(":", 1)
+        if host in ("0.0.0.0", "::", ""):
+            host = "*"
+        return f"{host}:{port}"
+
     @staticmethod
     def _canonical_addr(addr: str) -> str:
         """Normalize an address string to a single `host:port` form.
@@ -1702,8 +1736,12 @@ class NetTopPlusPlusApp:
                     remote_host = NetTopPlusPlusApp._ipv6_from_hex(remote_hex)
                 else:
                     remote_host = NetTopPlusPlusApp._ipv4_from_hex(remote_hex)
-                local = f"{local_host}:{int(local_port, 16)}"
-                remote = f"{remote_host}:{int(remote_port, 16)}"
+                local = NetTopPlusPlusApp._canonical_endpoint(
+                    f"{local_host}:{int(local_port, 16)}"
+                )
+                remote = NetTopPlusPlusApp._canonical_endpoint(
+                    f"{remote_host}:{int(remote_port, 16)}"
+                )
                 if proto.startswith("UDP"):
                     state = "UNCONN" if state_code == "07" else TCP_STATE_NAMES.get(state_code, state_code)
                 else:
@@ -1758,10 +1796,16 @@ class NetTopPlusPlusApp:
             elif prefix == "n":
                 if "->" in value:
                     local_raw, remote_raw = value.split("->", 1)
-                    local = NetTopPlusPlusApp._canonical_addr(local_raw)
-                    remote = NetTopPlusPlusApp._canonical_addr(remote_raw)
+                    local = NetTopPlusPlusApp._canonical_endpoint(
+                        NetTopPlusPlusApp._canonical_addr(local_raw)
+                    )
+                    remote = NetTopPlusPlusApp._canonical_endpoint(
+                        NetTopPlusPlusApp._canonical_addr(remote_raw)
+                    )
                 else:
-                    local = NetTopPlusPlusApp._canonical_addr(value)
+                    local = NetTopPlusPlusApp._canonical_endpoint(
+                        NetTopPlusPlusApp._canonical_addr(value)
+                    )
                     remote = "*:*"
                 if not local:
                     continue
