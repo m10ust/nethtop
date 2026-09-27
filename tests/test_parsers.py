@@ -108,8 +108,8 @@ class LinuxProcNetParseTests(unittest.TestCase):
     def test_tcp_table(self):
         tables = [("TCP", _fixture("linux_proc_net_tcp.txt"))]
         parsed = App._parse_proc_net_output(tables)
-        self.assertIn(("TCP", "127.0.0.1:8080", "0.0.0.0:0"), parsed)
-        self.assertEqual(parsed[("TCP", "127.0.0.1:8080", "0.0.0.0:0")]["state"], "LISTEN")
+        self.assertIn(("TCP", "127.0.0.1:8080", "*:*"), parsed)
+        self.assertEqual(parsed[("TCP", "127.0.0.1:8080", "*:*")]["state"], "LISTEN")
         # 640AA8C0 little-endian = 192.168.10.100, 08080808 = 8.8.8.8, 01BB = 443
         self.assertIn(("TCP", "192.168.10.100:51966", "8.8.8.8:443"), parsed)
         self.assertEqual(parsed[("TCP", "192.168.10.100:51966", "8.8.8.8:443")]["state"], "ESTABLISHED")
@@ -117,15 +117,15 @@ class LinuxProcNetParseTests(unittest.TestCase):
     def test_ipv6_rows(self):
         tables = [("TCP6", _fixture("linux_proc_net_tcp.txt"))]
         parsed = App._parse_proc_net_output(tables)
-        # all-zero IPv6 -> "::" host
-        self.assertIn(("TCP", ":::5796", ":::0"), parsed)
+        # all-zero IPv6 is a wildcard bind -> "*", matching what lsof prints
+        self.assertIn(("TCP", "*:5796", "*:*"), parsed)
         # ::1:80 — compressed, matching lsof's canonical "[::1]:80" -> "::1:80"
-        self.assertIn(("TCP", "::1:80", ":::0"), parsed)
+        self.assertIn(("TCP", "::1:80", "*:*"), parsed)
 
     def test_udp_state_unconn(self):
         tables = [("UDP", _fixture("linux_proc_net_udp.txt"))]
         parsed = App._parse_proc_net_output(tables)
-        self.assertEqual(parsed[("UDP", "127.0.0.1:53", "0.0.0.0:0")]["state"], "UNCONN")
+        self.assertEqual(parsed[("UDP", "127.0.0.1:53", "*:*")]["state"], "UNCONN")
 
 
 class LsofParseTests(unittest.TestCase):
@@ -162,6 +162,57 @@ class KernelUserlandMatchTests(unittest.TestCase):
         self.assertIn(("TCP", "*:49152", "*:*"), kernel)
         self.assertIn(("TCP", "*:49152", "*:*"), userland)
         self.assertNotIn(("TCP", "*:49152", "*:*"), {k for k in kernel if k not in userland})
+
+
+class LinuxKernelUserlandMatchTests(unittest.TestCase):
+    """The Linux sibling of the macOS canonical-key test.
+
+    The hardening pass canonicalized key spelling for macOS, where netstat uses
+    the dot form and lsof the colon form. The Linux /proc parser was left
+    emitting 0.0.0.0:0 for an absent peer and 0.0.0.0 for a wildcard bind, while
+    lsof emits *:* and *, so on Linux every listener that both tools could
+    plainly see was scored as a ghost.
+    """
+
+    WILDCARD_ROW = (
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
+        "   uid  timeout inode\n"
+        "   0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000"
+        "     0        0 90001 1 0000000000000000 100 0 0 10 0\n"
+    )
+
+    def test_shared_socket_is_not_a_ghost(self):
+        kernel = App._parse_proc_net_output([("TCP", _fixture("linux_proc_net_tcp.txt"))])
+        userland = App._parse_lsof_output(_fixture("lsof_linux.txt"))
+        self.assertIn(("TCP", "192.168.10.100:51966", "8.8.8.8:443"), kernel)
+        self.assertIn(("TCP", "192.168.10.100:51966", "8.8.8.8:443"), userland)
+        self.assertNotIn(("TCP", "192.168.10.100:51966", "8.8.8.8:443"),
+                         {k for k in kernel if k not in userland})
+
+    def test_wildcard_bind_matches_across_parsers(self):
+        """A wildcard listener is 0.0.0.0 in /proc and * in lsof."""
+        kernel = App._parse_proc_net_output([("TCP", self.WILDCARD_ROW)])
+        userland = App._parse_lsof_output(_fixture("lsof_linux.txt"))
+        self.assertIn(("TCP", "*:8080", "*:*"), kernel)
+        self.assertIn(("TCP", "*:8080", "*:*"), userland)
+        self.assertEqual([k for k in kernel if k not in userland], [])
+
+    def test_no_parser_leaks_a_raw_null_endpoint(self):
+        kernel = App._parse_proc_net_output([
+            ("TCP", _fixture("linux_proc_net_tcp.txt")),
+            ("UDP", _fixture("linux_proc_net_udp.txt")),
+        ])
+        userland = App._parse_lsof_output(_fixture("lsof_linux.txt"))
+        for key in kernel:
+            self.assertNotIn(key[2], ("0.0.0.0:0", ":::0", "::0"),
+                             "a raw null remote leaked into a kernel key")
+        for key in userland:
+            # A real peer keeps its address; only a null peer collapses.
+            self.assertNotEqual(key[2], "", "lsof peer must never be empty")
+            self.assertNotIn(key[2], ("0.0.0.0:0", ":::0", "*.*"),
+                             "a raw null peer leaked into an lsof key")
+        # the listener really is canonicalized, and keeps its pid
+        self.assertEqual(userland[("TCP", "*:8080", "*:*")]["pid"], "1122")
 
 
 class GhostConfidenceTests(unittest.TestCase):
@@ -215,6 +266,10 @@ class GhostDetectionUnavailableTests(unittest.TestCase):
         stub._parse_lsof_output = App._parse_lsof_output
         stub._record_alert = lambda alert: stub.recorded.append(alert)
         stub._run_command = lambda *a, **k: ""  # must never be reached for these tests
+        # Linux ground truth is unreadable in a unit test, so force the netstat
+        # fallback these tests were written against.
+        stub._read_proc_net_tables = lambda: None
+        stub._build_socket_pid_index = lambda: {}
         return stub
 
     def test_missing_lsof_reports_unavailable(self):
@@ -266,7 +321,9 @@ class GhostDetectionPipelineTests(unittest.TestCase):
         stub._parse_netstat_output = App._parse_netstat_output
         stub._parse_lsof_output = App._parse_lsof_output
         stub._ghost_confidence = App._ghost_confidence
-        stub._identify_process_for_socket = lambda proto, local, remote: None
+        stub._parse_netstat_addr = App._parse_netstat_addr
+        stub._read_proc_net_tables = lambda: None
+        stub._build_socket_pid_index = lambda: {}
         stub._record_alert = lambda alert: stub.recorded.append(alert)
 
         alerts = stub._detect_ghost_sockets()
@@ -283,6 +340,55 @@ class GhostDetectionPipelineTests(unittest.TestCase):
             self.assertTrue(entry["reasons"])
         self.assertEqual(len(alerts), 1)
         self.assertIn("ghost sockets detected", alerts[0].summary)
+
+
+
+class GhostScanCostTests(unittest.TestCase):
+    """Regression: the process table is swept ONCE per scan, never per ghost.
+
+    The first version of ghost detection called _identify_process_for_socket
+    inside the ghost loop, and that walks every process on the box. On a
+    530-process machine with 122 ghosts that is ~65k connection collections and
+    measured 78 seconds inside update_data(), all of it before the first paint,
+    so the UI sat on a blank screen. This test fails if the per-ghost walk comes
+    back, because it makes calling that method an error.
+    """
+
+    def test_process_table_swept_once_for_many_ghosts(self):
+        stub = types.SimpleNamespace()
+        stub.dep_availability = {"lsof": True, "netstat": True}
+        stub.ghost_entries = []
+        stub.show_ghost_overlay = False
+        stub.ghost_cursor = 0
+        stub.ghost_detection_unavailable = False
+        stub.ghost_persistence = {}
+        stub.recorded = []
+        stub.is_root = True
+
+        def run_command(cmd, timeout=7):
+            if cmd[0] == "netstat":
+                return _fixture("macos_netstat_anv.txt")
+            return _fixture("lsof_macos.txt")
+
+        builds = []
+        stub._run_command = run_command
+        stub._read_proc_net_tables = lambda: None
+        stub._detect_ghost_sockets = types.MethodType(App._detect_ghost_sockets, stub)
+        stub._ghost_unavailable = types.MethodType(App._ghost_unavailable, stub)
+        stub._parse_netstat_output = App._parse_netstat_output
+        stub._parse_lsof_output = App._parse_lsof_output
+        stub._parse_netstat_addr = App._parse_netstat_addr
+        stub._ghost_confidence = App._ghost_confidence
+        stub._record_alert = lambda alert: stub.recorded.append(alert)
+        stub._build_socket_pid_index = lambda: (builds.append(1), {})[1]
+        stub._identify_process_for_socket = lambda *a, **k: self.fail(
+            "per-ghost process-table walk is back: that is the 78s first-paint freeze"
+        )
+
+        stub._detect_ghost_sockets()
+
+        self.assertTrue(stub.ghost_entries, "fixtures should yield ghosts to score")
+        self.assertEqual(len(builds), 1, "socket index must be built once per scan")
 
 
 if __name__ == "__main__":

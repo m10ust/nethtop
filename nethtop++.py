@@ -1348,6 +1348,39 @@ class NetTopPlusPlusApp:
             )
         return anomalies
 
+    def _build_socket_pid_index(self) -> Dict[Tuple[str, Tuple[str, int], Optional[Tuple[str, int]]], int]:
+        """Index every process's sockets in ONE pass, so ghost lookups are O(1).
+
+        The ghost scan used to call _identify_process_for_socket once per ghost,
+        and that walks the entire process table every call: O(ghosts x
+        processes). On a 530-process box with 122 ghosts that is ~65k connection
+        collections and measured 78 seconds inside update_data(), all of it
+        before the first paint, so the UI just sat on a blank screen. Building
+        the index once turns the same work into a single sweep plus dict
+        lookups. Keys mirror what _identify_process_for_socket compares:
+        (base protocol, local addr tuple, remote addr tuple or None).
+        """
+        index: Dict[Tuple[str, Tuple[str, int], Optional[Tuple[str, int]]], int] = {}
+        try:
+            for proc in psutil.process_iter(["pid"]):
+                conns = self._process_net_connections(proc)
+                if not conns:
+                    continue
+                for conn in conns:
+                    laddr = self._addr_tuple(conn.laddr)
+                    if not laddr:
+                        continue
+                    key = (
+                        self._protocol_name(conn)[:3].upper(),
+                        laddr,
+                        self._addr_tuple(conn.raddr),
+                    )
+                    if key not in index:
+                        index[key] = proc.pid
+        except psutil.Error:  # pragma: no cover - defensive
+            return index
+        return index
+
     def _identify_process_for_socket(self, proto: str, local: str, remote: str) -> Optional[int]:
         local_tuple = self._parse_netstat_addr(local)
         remote_tuple = self._parse_netstat_addr(remote) if remote else None
@@ -1371,6 +1404,40 @@ class NetTopPlusPlusApp:
         except psutil.Error:
             return None
         return None
+
+    # Endpoints that mean "no peer" or "every interface". Linux /proc/net calls a
+    # wildcard bind 0.0.0.0 (:: for IPv6) and an absent peer 0.0.0.0:0; lsof
+    # prints * and *:*; macOS netstat prints *.* for both. Same socket, three
+    # spellings, so every side has to collapse to one or the kernel/userland diff
+    # reports sockets that both tools can plainly see.
+    NULL_ENDPOINTS = ("*:*", "*.*", "0.0.0.0:0", ":::0", "::0", "0.0.0.0:*", "*:0", ":::")
+
+    @staticmethod
+    def _canonical_endpoint(addr: str) -> str:
+        """Collapse wildcard and absent-peer spellings so keys compare equal.
+
+        The hardening pass canonicalized this for macOS (netstat dot form vs lsof
+        colon form) but the Linux /proc parser kept emitting 0.0.0.0:0, so on
+        Linux a listener both tools could see was still scored as a ghost.
+        """
+        raw = (addr or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith("["):
+            # bracketed IPv6 from lsof: [fe80::1%lo0]:546
+            if "]:" in raw:
+                host, port = raw[1:].split("]:", 1)
+                raw = f"{host}:{port}"
+            else:
+                return raw[1:-1] if raw.endswith("]") else raw
+        if raw in NetTopPlusPlusApp.NULL_ENDPOINTS:
+            return "*:*"
+        if ":" not in raw:
+            return raw
+        host, port = raw.rsplit(":", 1)
+        if host in ("0.0.0.0", "::", ""):
+            host = "*"
+        return f"{host}:{port}"
 
     @staticmethod
     def _canonical_addr(addr: str) -> str:
@@ -1476,12 +1543,21 @@ class NetTopPlusPlusApp:
         ghosts = [(key, data) for key, data in kernel_sockets.items() if key not in userland_sockets]
         unprivileged = not self.is_root
 
+        # One sweep of the process table, then O(1) lookups. Calling the
+        # per-socket identifier inside this loop walked every process once per
+        # ghost, which measured 78s with 122 ghosts and blocked the first paint.
+        socket_pid_index = self._build_socket_pid_index() if ghosts else {}
+
         entries: List[Dict[str, Any]] = []
         seen_keys: set = set()
         for key, data in ghosts:
             proto, local, remote = key
             seen_keys.add(key)
-            candidate_pid = self._identify_process_for_socket(proto, local, remote)
+            local_tuple = self._parse_netstat_addr(local)
+            remote_tuple = self._parse_netstat_addr(remote) if remote else None
+            candidate_pid = socket_pid_index.get(
+                (proto[:3].upper(), local_tuple, remote_tuple)
+            )
             persistence = self.ghost_persistence.get(key, 0)
             confidence, reasons = self._ghost_confidence(data, candidate_pid, persistence, unprivileged=unprivileged)
             entries.append(
@@ -1660,8 +1736,12 @@ class NetTopPlusPlusApp:
                     remote_host = NetTopPlusPlusApp._ipv6_from_hex(remote_hex)
                 else:
                     remote_host = NetTopPlusPlusApp._ipv4_from_hex(remote_hex)
-                local = f"{local_host}:{int(local_port, 16)}"
-                remote = f"{remote_host}:{int(remote_port, 16)}"
+                local = NetTopPlusPlusApp._canonical_endpoint(
+                    f"{local_host}:{int(local_port, 16)}"
+                )
+                remote = NetTopPlusPlusApp._canonical_endpoint(
+                    f"{remote_host}:{int(remote_port, 16)}"
+                )
                 if proto.startswith("UDP"):
                     state = "UNCONN" if state_code == "07" else TCP_STATE_NAMES.get(state_code, state_code)
                 else:
@@ -1716,10 +1796,16 @@ class NetTopPlusPlusApp:
             elif prefix == "n":
                 if "->" in value:
                     local_raw, remote_raw = value.split("->", 1)
-                    local = NetTopPlusPlusApp._canonical_addr(local_raw)
-                    remote = NetTopPlusPlusApp._canonical_addr(remote_raw)
+                    local = NetTopPlusPlusApp._canonical_endpoint(
+                        NetTopPlusPlusApp._canonical_addr(local_raw)
+                    )
+                    remote = NetTopPlusPlusApp._canonical_endpoint(
+                        NetTopPlusPlusApp._canonical_addr(remote_raw)
+                    )
                 else:
-                    local = NetTopPlusPlusApp._canonical_addr(value)
+                    local = NetTopPlusPlusApp._canonical_endpoint(
+                        NetTopPlusPlusApp._canonical_addr(value)
+                    )
                     remote = "*:*"
                 if not local:
                     continue
