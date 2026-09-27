@@ -215,6 +215,10 @@ class GhostDetectionUnavailableTests(unittest.TestCase):
         stub._parse_lsof_output = App._parse_lsof_output
         stub._record_alert = lambda alert: stub.recorded.append(alert)
         stub._run_command = lambda *a, **k: ""  # must never be reached for these tests
+        # Linux ground truth is unreadable in a unit test, so force the netstat
+        # fallback these tests were written against.
+        stub._read_proc_net_tables = lambda: None
+        stub._build_socket_pid_index = lambda: {}
         return stub
 
     def test_missing_lsof_reports_unavailable(self):
@@ -266,7 +270,9 @@ class GhostDetectionPipelineTests(unittest.TestCase):
         stub._parse_netstat_output = App._parse_netstat_output
         stub._parse_lsof_output = App._parse_lsof_output
         stub._ghost_confidence = App._ghost_confidence
-        stub._identify_process_for_socket = lambda proto, local, remote: None
+        stub._parse_netstat_addr = App._parse_netstat_addr
+        stub._read_proc_net_tables = lambda: None
+        stub._build_socket_pid_index = lambda: {}
         stub._record_alert = lambda alert: stub.recorded.append(alert)
 
         alerts = stub._detect_ghost_sockets()
@@ -283,6 +289,55 @@ class GhostDetectionPipelineTests(unittest.TestCase):
             self.assertTrue(entry["reasons"])
         self.assertEqual(len(alerts), 1)
         self.assertIn("ghost sockets detected", alerts[0].summary)
+
+
+
+class GhostScanCostTests(unittest.TestCase):
+    """Regression: the process table is swept ONCE per scan, never per ghost.
+
+    The first version of ghost detection called _identify_process_for_socket
+    inside the ghost loop, and that walks every process on the box. On a
+    530-process machine with 122 ghosts that is ~65k connection collections and
+    measured 78 seconds inside update_data(), all of it before the first paint,
+    so the UI sat on a blank screen. This test fails if the per-ghost walk comes
+    back, because it makes calling that method an error.
+    """
+
+    def test_process_table_swept_once_for_many_ghosts(self):
+        stub = types.SimpleNamespace()
+        stub.dep_availability = {"lsof": True, "netstat": True}
+        stub.ghost_entries = []
+        stub.show_ghost_overlay = False
+        stub.ghost_cursor = 0
+        stub.ghost_detection_unavailable = False
+        stub.ghost_persistence = {}
+        stub.recorded = []
+        stub.is_root = True
+
+        def run_command(cmd, timeout=7):
+            if cmd[0] == "netstat":
+                return _fixture("macos_netstat_anv.txt")
+            return _fixture("lsof_macos.txt")
+
+        builds = []
+        stub._run_command = run_command
+        stub._read_proc_net_tables = lambda: None
+        stub._detect_ghost_sockets = types.MethodType(App._detect_ghost_sockets, stub)
+        stub._ghost_unavailable = types.MethodType(App._ghost_unavailable, stub)
+        stub._parse_netstat_output = App._parse_netstat_output
+        stub._parse_lsof_output = App._parse_lsof_output
+        stub._parse_netstat_addr = App._parse_netstat_addr
+        stub._ghost_confidence = App._ghost_confidence
+        stub._record_alert = lambda alert: stub.recorded.append(alert)
+        stub._build_socket_pid_index = lambda: (builds.append(1), {})[1]
+        stub._identify_process_for_socket = lambda *a, **k: self.fail(
+            "per-ghost process-table walk is back: that is the 78s first-paint freeze"
+        )
+
+        stub._detect_ghost_sockets()
+
+        self.assertTrue(stub.ghost_entries, "fixtures should yield ghosts to score")
+        self.assertEqual(len(builds), 1, "socket index must be built once per scan")
 
 
 if __name__ == "__main__":
